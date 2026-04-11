@@ -1,0 +1,6 @@
+dataset_root: datasets
+dataset_name: ReplicaReID
+segmentation_type: maskrcnn   # maskrcnn | semantic_sam (semantic_sam not bundled here)
+object_backbone: resnet50
+segmentation_threshold: 0.60
+overwrite: true

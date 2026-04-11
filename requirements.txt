@@ -1,0 +1,9 @@
+torch
+torchvision
+transformers
+scipy
+scikit-learn
+pillow
+pyyaml
+opencv-python
+lightglue

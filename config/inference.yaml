@@ -1,0 +1,10 @@
+dataset_root: datasets
+dataset_name: ReplicaReID
+segmentation_type: maskrcnn
+object_backbone: resnet50
+segmentation_threshold: 0.60
+top5_k: 5
+top2_k: 2
+patch_score_mode: max        # mean | max
+object_score_mode: mean      # mean | max
+output_csv: results/replicareid_results.csv
