@@ -11,7 +11,13 @@ from PIL import Image
 
 from data.query_dataset import QueryDataset
 from data.reference_dataset import ReferenceDataset
-from models.build_model import build_anyloc, build_fine_matcher, build_resnet, build_segmentation, default_preprocess
+from models.build_model import (
+    build_anyloc,
+    build_fine_matcher,
+    build_resnet,
+    build_segmentation,
+    default_preprocess,
+)
 from utils.geometry import calculate_center, get_adjacent_matrix, get_patches
 from utils.scoring import object_aware_score
 
@@ -24,7 +30,7 @@ def load_config(config_path: str | Path) -> dict:
 
 
 @torch.no_grad()
-def segment_and_encode(image_path: Path, seg_model, object_model, score_threshold: float = 0.6) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+def segment_and_encode(image_path: Path, seg_model, object_model, score_threshold: float = 0.6):
     image = Image.open(image_path).convert("RGB")
     outputs = seg_model.generate(image, score_threshold=score_threshold)
 
@@ -68,28 +74,57 @@ def segment_and_encode(image_path: Path, seg_model, object_model, score_threshol
 def load_reference_db(dataset_root: Path, dataset_name: str) -> list[dict]:
     db = []
     reference_dataset = ReferenceDataset(dataset_root, dataset_name)
+
     for room in reference_dataset:
         room_feature = torch.load(room.embed_dir / "room_feature.pt", map_location="cpu")
-        objects = torch.load(room.embed_dir / "objects.pt", map_location="cpu")
-        patches = torch.load(room.embed_dir / "patches.pt", map_location="cpu")
+
+        object_files = sorted(room.embed_dir.glob("objects_*.pt"))
+        patch_files = sorted(room.embed_dir.glob("patches_*.pt"))
+
+        ref_entries = []
+        for idx, ref_path in enumerate(room.ref_rgb_paths):
+            objects = None
+            patches = None
+
+            if idx < len(object_files):
+                objects = torch.load(object_files[idx], map_location="cpu")
+                if objects is not None:
+                    objects = objects.float()
+
+            if idx < len(patch_files):
+                patches = torch.load(patch_files[idx], map_location="cpu")
+                if patches is not None:
+                    patches = patches.float()
+
+            ref_entries.append(
+                {
+                    "ref_rgb_path": ref_path,
+                    "objects": objects,
+                    "patches": patches,
+                }
+            )
+
         db.append(
             {
                 "scene": room.scene,
                 "room": room.room,
-                "ref_rgb_path": room.ref_rgb_path,
                 "room_feature": room_feature.float().view(1, -1),
-                "objects": None if objects is None else objects.float(),
-                "patches": None if patches is None else patches.float(),
+                "references": ref_entries,
             }
         )
+
     return db
 
 
 @torch.no_grad()
 def cosine_topk(query_feature: torch.Tensor, reference_db: list[dict], k: int = 5) -> list[dict]:
     q = torch.nn.functional.normalize(query_feature.view(1, -1), dim=1)
-    refs = torch.cat([torch.nn.functional.normalize(item["room_feature"], dim=1) for item in reference_db], dim=0)
+    refs = torch.cat(
+        [torch.nn.functional.normalize(item["room_feature"], dim=1) for item in reference_db],
+        dim=0,
+    )
     sims = (q @ refs.T).squeeze(0)
+
     indices = torch.argsort(sims, descending=True)[:k].tolist()
     out = []
     for idx in indices:
@@ -99,10 +134,21 @@ def cosine_topk(query_feature: torch.Tensor, reference_db: list[dict], k: int = 
     return out
 
 
+def reduce_scores(scores: list[float], mode: str = "max") -> float:
+    if not scores:
+        return 0.0
+    if mode == "max":
+        return float(max(scores))
+    if mode == "mean":
+        return float(sum(scores) / len(scores))
+    raise ValueError(f"Unsupported reduction mode: {mode}")
+
+
 @torch.no_grad()
 def run_inference(config: dict) -> list[dict]:
     dataset_root = Path(config.get("dataset_root", "datasets"))
     dataset_name = config["dataset_name"]
+
     query_dataset = QueryDataset(dataset_root, dataset_name, exclude_reference=False)
     reference_db = load_reference_db(dataset_root, dataset_name)
 
@@ -116,28 +162,63 @@ def run_inference(config: dict) -> list[dict]:
     patch_mode = config.get("patch_score_mode", "max")
     object_mode = config.get("object_score_mode", "mean")
     seg_thr = float(config.get("segmentation_threshold", 0.6))
+    multi_reference_mode = config.get("multi_reference_mode", "max")
+    fine_match_mode = config.get("fine_match_mode", "max")
 
     results = []
+
     for query in query_dataset:
         query_image = Image.open(query.image_path).convert("RGB")
         query_global = global_extractor.encode_pil(query_image)
         top5 = cosine_topk(query_global, reference_db, k=top5_k)
 
-        _, q_objects, q_patches = segment_and_encode(query.image_path, seg_model, object_model, score_threshold=seg_thr)
+        _, q_objects, q_patches = segment_and_encode(
+            query.image_path, seg_model, object_model, score_threshold=seg_thr
+        )
+
         rescored = []
         for candidate in top5:
-            score_parts = object_aware_score(
-                global_score=candidate["global_score"],
-                q_patches=q_patches,
-                r_patches=candidate["patches"],
-                q_objects=q_objects,
-                r_objects=candidate["objects"],
-                patch_mode=patch_mode,
-                object_mode=object_mode,
-            )
-            enriched = dict(candidate)
-            enriched.update(score_parts)
+            per_ref_scores = []
+
+            for ref_entry in candidate["references"]:
+                score_parts = object_aware_score(
+                    global_score=candidate["global_score"],
+                    q_patches=q_patches,
+                    r_patches=ref_entry["patches"],
+                    q_objects=q_objects,
+                    r_objects=ref_entry["objects"],
+                    patch_mode=patch_mode,
+                    object_mode=object_mode,
+                )
+                per_ref_scores.append(
+                    {
+                        "ref_rgb_path": ref_entry["ref_rgb_path"],
+                        "global": float(score_parts["global"]),
+                        "patch": float(score_parts["patch"]),
+                        "object": float(score_parts["object"]),
+                        "total": float(score_parts["total"]),
+                    }
+                )
+
+            if not per_ref_scores:
+                continue
+
+            if multi_reference_mode == "max":
+                best_ref = max(per_ref_scores, key=lambda x: x["total"])
+                enriched = dict(candidate)
+                enriched.update(best_ref)
+            elif multi_reference_mode == "mean":
+                enriched = dict(candidate)
+                enriched["ref_rgb_path"] = per_ref_scores[0]["ref_rgb_path"]
+                enriched["global"] = reduce_scores([x["global"] for x in per_ref_scores], "mean")
+                enriched["patch"] = reduce_scores([x["patch"] for x in per_ref_scores], "mean")
+                enriched["object"] = reduce_scores([x["object"] for x in per_ref_scores], "mean")
+                enriched["total"] = reduce_scores([x["total"] for x in per_ref_scores], "mean")
+            else:
+                raise ValueError(f"Unsupported multi_reference_mode: {multi_reference_mode}")
+
             rescored.append(enriched)
+
         rescored.sort(key=lambda x: x["total"], reverse=True)
         top2 = rescored[:top2_k]
 
@@ -146,15 +227,39 @@ def run_inference(config: dict) -> list[dict]:
             fine_matches = 0
         else:
             q_img = Image.open(query.image_path).convert("RGB")
-            fine_counts = []
+
+            fine_candidate_scores = []
             for cand in top2:
-                ref_img = Image.open(cand["ref_rgb_path"]).convert("RGB")
-                fine_counts.append(fine_matcher.count_matches(q_img, ref_img))
-            best_idx = int(np.argmax(fine_counts))
-            final = top2[best_idx]
-            fine_matches = int(fine_counts[best_idx])
+                per_ref_fine = []
+                for ref_entry in cand["references"]:
+                    ref_img = Image.open(ref_entry["ref_rgb_path"]).convert("RGB")
+                    per_ref_fine.append(fine_matcher.count_matches(q_img, ref_img))
+
+                if fine_match_mode == "max":
+                    best_fine = max(per_ref_fine) if per_ref_fine else 0
+                    best_ref_idx = int(np.argmax(per_ref_fine)) if per_ref_fine else 0
+                elif fine_match_mode == "mean":
+                    best_fine = int(np.mean(per_ref_fine)) if per_ref_fine else 0
+                    best_ref_idx = int(np.argmax(per_ref_fine)) if per_ref_fine else 0
+                else:
+                    raise ValueError(f"Unsupported fine_match_mode: {fine_match_mode}")
+
+                fine_candidate_scores.append(
+                    {
+                        "candidate": cand,
+                        "fine_matches": int(best_fine),
+                        "best_ref_path": cand["references"][best_ref_idx]["ref_rgb_path"],
+                    }
+                )
+
+            best_idx = int(np.argmax([x["fine_matches"] for x in fine_candidate_scores]))
+            picked = fine_candidate_scores[best_idx]
+            final = dict(picked["candidate"])
+            final["ref_rgb_path"] = picked["best_ref_path"]
+            fine_matches = picked["fine_matches"]
 
         correct = int(final["room"] == query.room)
+
         results.append(
             {
                 "scene": query.scene,
@@ -168,9 +273,10 @@ def run_inference(config: dict) -> list[dict]:
                 "patch_score": float(final["patch"]),
                 "object_score": float(final["object"]),
                 "total_score": float(final["total"]),
-                "fine_matches": fine_matches,
+                "fine_matches": int(fine_matches),
             }
         )
+
         print(f"query={query.image_path.name} gt={query.room} pred={final['room']} correct={correct}")
 
     return results
@@ -180,6 +286,7 @@ def save_results(results: list[dict], output_csv: Path) -> None:
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     if not results:
         return
+
     with open(output_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(results[0].keys()))
         writer.writeheader()
@@ -197,7 +304,7 @@ if __name__ == "__main__":
     warnings.filterwarnings("ignore")
     config = load_config(Path("config") / "inference.yaml")
     results = run_inference(config)
-    output_csv = Path(config.get("output_csv", "results/inference_results.csv"))
+    output_csv = Path(config.get("output_csv", "outputs/results.csv"))
     save_results(results, output_csv)
     summary = summarize(results)
     print(summary)
