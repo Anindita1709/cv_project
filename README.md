@@ -1,6 +1,6 @@
-# Object Aware RoomReIdentification
+# Object Aware Room Re-Identification
 
-This repository contains a PyTorch reimplementation of the AirRoom pipeline for indoor room re-identification using global, object-level, and fine-grained matching cues.
+This repository contains a PyTorch reimplementation of the pipeline for indoor room re-identification using global, object-level, and fine-grained matching cues.
 
 ## Project Overview
 
